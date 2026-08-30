@@ -1,11 +1,9 @@
 import { inngest } from "../inngest";
 import { recoveryEngine } from "@/lib/recovery/engine";
 
-// Inngest v4 API: createFunction(opts, handler)  — opts may include triggers
-// We use `as any` to stay compatible across versions
-export const handleFailedPayment: any = (inngest as any).createFunction(
-  { id: "handle-failed-payment" },
-  { event: "payment.failed" },
+// Inngest v4: createFunction({ id, triggers: [{ event }] }, handler)
+export const handleFailedPayment = inngest.createFunction(
+  { id: "handle-failed-payment", triggers: [{ event: "payment.failed" }] } as any,
   async ({ event, step }: any) => {
     const { recoveryCaseId } = event.data as { recoveryCaseId: string };
     await step.run("run-recovery-engine", async () => {
@@ -15,9 +13,8 @@ export const handleFailedPayment: any = (inngest as any).createFunction(
   }
 );
 
-export const retryRecovery: any = (inngest as any).createFunction(
-  { id: "retry-recovery" },
-  { event: "recovery.retry" },
+export const retryRecovery = inngest.createFunction(
+  { id: "retry-recovery", triggers: [{ event: "recovery.retry" }] } as any,
   async ({ event, step }: any) => {
     const { recoveryCaseId } = event.data as { recoveryCaseId: string };
     await step.sleep("wait-before-retry", "30m");
