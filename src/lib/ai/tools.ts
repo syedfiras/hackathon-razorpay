@@ -1,5 +1,5 @@
 // Server-side tool definitions — autonomous agent tools (simulated/real)
-import { prisma } from "@/lib/db/prisma";
+import { supabase } from "@/lib/db/supabase";
 import type { TransactionContext } from "@/types";
 
 export const toolDefinitions = [
@@ -47,34 +47,59 @@ export const toolDefinitions = [
 
 // Implementations — used by engine.ts
 export async function getPayment(paymentId: string) {
-  return prisma.payment.findUnique({
-    where: { id: paymentId },
-    include: { failureEvents: true, attempts: true },
-  });
+  const { data, error } = await supabase
+    .from("payments")
+    .select(`
+      *,
+      failure_events:failure_events(*),
+      attempts:payment_attempts(*)
+    `)
+    .eq("id", paymentId)
+    .single();
+  if (error) return null;
+  return data;
 }
 
 export async function getCustomerHistory(customerId: string) {
-  const customer = await prisma.customer.findUnique({
-    where: { id: customerId },
-  });
-  if (!customer) return null;
-  const recentPayments = await prisma.payment.findMany({
-    where: { customerId },
-    orderBy: { createdAt: "desc" },
-    take: 10,
-  });
-  const recentFailures = recentPayments.filter((p) => p.status === "failed").length;
-  const recoveryCases = await prisma.recoveryCase.count({
-    where: { payment: { customerId }, status: "recovered" },
-  });
-  return { customer, recentPayments, recentFailures, recoveryCases };
+  const { data: customer, error } = await supabase
+    .from("customers")
+    .select("*")
+    .eq("id", customerId)
+    .single();
+  if (error || !customer) return null;
+  const { data: recentPayments } = await supabase
+    .from("payments")
+    .select("*")
+    .eq("customer_id", customerId)
+    .order("created_at", { ascending: false })
+    .limit(10);
+  const recentFailures = (recentPayments || []).filter((p: any) => p.status === "failed").length;
+
+  // Count recovered cases for this customer via payment join
+  const { data: paymentsForCustomer } = await supabase
+    .from("payments")
+    .select("id")
+    .eq("customer_id", customerId);
+  const paymentIds = (paymentsForCustomer || []).map((p: any) => p.id);
+  let recoveryCases = 0;
+  if (paymentIds.length > 0) {
+    const { count } = await supabase
+      .from("recovery_cases")
+      .select("id", { count: "exact", head: true })
+      .in("payment_id", paymentIds)
+      .eq("status", "recovered");
+    recoveryCases = count || 0;
+  }
+  return { customer, recentPayments: recentPayments || [], recentFailures, recoveryCases };
 }
 
 export async function getFailureDetails(paymentId: string) {
-  return prisma.failureEvent.findMany({
-    where: { paymentId },
-    orderBy: { createdAt: "desc" },
-  });
+  const { data } = await supabase
+    .from("failure_events")
+    .select("*")
+    .eq("payment_id", paymentId)
+    .order("created_at", { ascending: false });
+  return data || [];
 }
 
 export function calculateRecoveryProbability(ctx: TransactionContext): number {

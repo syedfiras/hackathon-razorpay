@@ -1,4 +1,4 @@
-import { prisma } from "@/lib/db/prisma";
+import { supabase } from "@/lib/db/supabase";
 import type { AIDecisionAction } from "@/types";
 import { buildTransactionContext } from "./context";
 import { calculateRecoveryProbability } from "./scoring";
@@ -28,13 +28,61 @@ export class RecoveryEngine {
   }
 
   async run(recoveryCaseId: string): Promise<RecoveryRunResult> {
-    const recoveryCase = await prisma.recoveryCase.findUnique({
-      where: { id: recoveryCaseId },
-      include: { payment: { include: { customer: true } } },
-    });
-    if (!recoveryCase) throw new Error(`RecoveryCase ${recoveryCaseId} not found`);
+    // Fetch recovery case with payment + customer
+    const { data: rcRaw, error: rcErr } = await supabase
+      .from("recovery_cases")
+      .select(`
+        *,
+        payment:payments(*, customer:customers(*))
+      `)
+      .eq("id", recoveryCaseId)
+      .single();
 
-    const payment = recoveryCase.payment;
+    if (rcErr || !rcRaw) throw new Error(`RecoveryCase ${recoveryCaseId} not found`);
+
+    // Normalize snake_case -> camelCase for internal logic
+    const recoveryCase: any = {
+      id: (rcRaw as any).id,
+      paymentId: (rcRaw as any).payment_id,
+      merchantId: (rcRaw as any).merchant_id,
+      status: (rcRaw as any).status,
+      recoveryProbability: (rcRaw as any).recovery_probability,
+      amountRecovered: (rcRaw as any).amount_recovered ?? 0,
+      lastAction: (rcRaw as any).last_action,
+      attemptCount: (rcRaw as any).attempt_count ?? 0,
+      maxAttempts: (rcRaw as any).max_attempts ?? 3,
+      createdAt: (rcRaw as any).created_at,
+      updatedAt: (rcRaw as any).updated_at,
+      payment: null as any,
+    };
+
+    const paymentRaw: any = (rcRaw as any).payment;
+    if (!paymentRaw) throw new Error(`Payment for RecoveryCase ${recoveryCaseId} not found`);
+    const customerRaw: any = paymentRaw.customer || paymentRaw.customers;
+    const payment: any = {
+      id: paymentRaw.id,
+      merchantId: paymentRaw.merchant_id,
+      customerId: paymentRaw.customer_id,
+      amount: paymentRaw.amount,
+      currency: paymentRaw.currency,
+      paymentMethod: paymentRaw.payment_method,
+      status: paymentRaw.status,
+      failureReason: paymentRaw.failure_reason,
+      failedAt: paymentRaw.failed_at,
+      recoveredAt: paymentRaw.recovered_at,
+      createdAt: paymentRaw.created_at,
+      customer: {
+        id: customerRaw.id,
+        name: customerRaw.name,
+        email: customerRaw.email,
+        segment: customerRaw.segment,
+        lifetimeValue: customerRaw.lifetime_value,
+        totalTransactions: customerRaw.total_transactions,
+        successfulTransactions: customerRaw.successful_transactions,
+        previousFailures: customerRaw.previous_failures,
+      },
+    };
+    recoveryCase.payment = payment;
 
     // Step 1: diagnose
     await this.recordAction(recoveryCaseId, "diagnose", "success", {
@@ -59,7 +107,6 @@ export class RecoveryEngine {
 
     // Step 5: AI decision
     const { decision, model, isFallback, error } = await this.agent.decide(context);
-    // Use deterministic prob as sanity if AI prob wildly off? Keep AI prob but log
     const recoveryProbability = decision.recovery_probability;
 
     await this.recordAction(recoveryCaseId, "ai_decision", "success", {
@@ -88,32 +135,32 @@ export class RecoveryEngine {
     });
 
     // Persist AgentDecision audit
-    await prisma.agentDecision.create({
-      data: {
-        recoveryCaseId,
-        model,
-        inputContext: context as any,
-        decision: decision.decision,
-        confidence: decision.confidence,
-        reasoning: decision.reason,
-        recoveryProbability,
-        fallbackAction: decision.fallback_action,
-        maxAttempts: decision.max_attempts,
-        policyVerdict: policyValidation.overridden ? "overridden" : "allowed",
-        policyReason: policyValidation.reason,
-        executedAction: policyValidation.finalAction,
-      },
+    const { error: decisionErr } = await supabase.from("agent_decisions").insert({
+      recovery_case_id: recoveryCaseId,
+      model,
+      input_context: context as any,
+      decision: decision.decision,
+      confidence: decision.confidence,
+      reasoning: decision.reason,
+      recovery_probability: recoveryProbability,
+      fallback_action: decision.fallback_action,
+      max_attempts: decision.max_attempts,
+      policy_verdict: policyValidation.overridden ? "overridden" : "allowed",
+      policy_reason: policyValidation.reason,
+      executed_action: policyValidation.finalAction,
     });
+    if (decisionErr) console.warn("[engine] agentDecision insert failed", decisionErr);
 
     // Step 7: Update case with probability and status
-    await prisma.recoveryCase.update({
-      where: { id: recoveryCaseId },
-      data: {
-        recoveryProbability,
+    await supabase
+      .from("recovery_cases")
+      .update({
+        recovery_probability: recoveryProbability,
         status: "in_progress",
-        lastAction: policyValidation.finalAction,
-      },
-    });
+        last_action: policyValidation.finalAction,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", recoveryCaseId);
 
     // Step 8: Execute recovery action (simulated)
     const execution = await this.executeAction(
@@ -127,39 +174,60 @@ export class RecoveryEngine {
     const success = execution.success;
     const amountRecovered = success ? payment.amount : 0;
 
-    await prisma.recoveryCase.update({
-      where: { id: recoveryCaseId },
-      data: {
-        attemptCount: { increment: 1 },
-        status: success ? "recovered" : recoveryCase.attemptCount + 1 >= recoveryCase.maxAttempts ? "failed" : "in_progress",
-        amountRecovered: success ? amountRecovered : 0,
-        lastAction: policyValidation.finalAction,
-      },
-    });
+    const newAttemptCount = recoveryCase.attemptCount + 1;
+    const newStatus = success
+      ? "recovered"
+      : newAttemptCount >= recoveryCase.maxAttempts
+        ? "failed"
+        : "in_progress";
+
+    await supabase
+      .from("recovery_cases")
+      .update({
+        attempt_count: newAttemptCount,
+        status: newStatus,
+        amount_recovered: success ? amountRecovered : 0,
+        last_action: policyValidation.finalAction,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", recoveryCaseId);
 
     // Also update payment status
     if (success) {
-      await prisma.payment.update({
-        where: { id: payment.id },
-        data: { status: "recovered", recoveredAt: new Date() },
-      });
-      // Update customer stats
-      await prisma.customer.update({
-        where: { id: payment.customerId },
-        data: {
-          successfulTransactions: { increment: 1 },
-          totalTransactions: { increment: 1 },
-        },
-      });
+      await supabase
+        .from("payments")
+        .update({ status: "recovered", recovered_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq("id", payment.id);
+
+      // Update customer stats — increment
+      const { data: cust } = await supabase
+        .from("customers")
+        .select("successful_transactions, total_transactions")
+        .eq("id", payment.customerId)
+        .single();
+      if (cust) {
+        await supabase
+          .from("customers")
+          .update({
+            successful_transactions: (cust as any).successful_transactions + 1,
+            total_transactions: (cust as any).total_transactions + 1,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", payment.customerId);
+      }
     }
 
-    // If failed but not terminal, we leave in_progress for next retry; else mark failed
+    const { data: timelineRaw } = await supabase
+      .from("recovery_actions")
+      .select("type, status, created_at")
+      .eq("recovery_case_id", recoveryCaseId)
+      .order("created_at", { ascending: true });
 
-    const timeline = await prisma.recoveryAction.findMany({
-      where: { recoveryCaseId },
-      orderBy: { createdAt: "asc" },
-      select: { type: true, status: true, createdAt: true },
-    });
+    const timeline = (timelineRaw || []).map((r: any) => ({
+      type: r.type,
+      status: r.status,
+      createdAt: new Date(r.created_at),
+    }));
 
     return {
       recoveryCaseId,
@@ -182,15 +250,19 @@ export class RecoveryEngine {
     status: string,
     output?: any
   ) {
-    return prisma.recoveryAction.create({
-      data: {
-        recoveryCaseId,
+    const { data, error } = await supabase
+      .from("recovery_actions")
+      .insert({
+        recovery_case_id: recoveryCaseId,
         type,
         status,
-        output: output ? (output as any) : undefined,
-        isSimulated: true,
-      },
-    });
+        output: output ? (output as any) : null,
+        is_simulated: true,
+      })
+      .select()
+      .single();
+    if (error) console.warn("[engine] recordAction failed", error);
+    return data;
   }
 
   private async executeAction(
@@ -199,23 +271,17 @@ export class RecoveryEngine {
     probability: number,
     amount: number
   ): Promise<{ success: boolean }> {
-    // Simulate processing delay
-    // Weighted success by probability with slight randomness
-    // For demo: add small variance so 87% doesn't always succeed
-    const jitter = (Math.random() - 0.5) * 0.2; // -0.1 .. +0.1
+    const jitter = (Math.random() - 0.5) * 0.2;
     const effectiveProb = Math.max(0.05, Math.min(0.95, probability + jitter));
     const success = Math.random() < effectiveProb;
 
-    // Special cases: expired_card never succeeds on retry, but link may succeed at lower rate
-    // We already policy-block retry, but handle here for safety
     let finalSuccess = success;
     if (action === "create_payment_link") {
-      // Payment link success is slightly lower than retry for transient failures
       finalSuccess = Math.random() < effectiveProb * 0.92;
     } else if (action === "escalate") {
       finalSuccess = false;
     } else if (action === "send_reminder" || action === "wait_and_retry") {
-      finalSuccess = false; // these are intermediate, not final recovery
+      finalSuccess = false;
     }
 
     await this.recordAction(recoveryCaseId, action, finalSuccess ? "success" : "failed", {
@@ -224,9 +290,6 @@ export class RecoveryEngine {
       simulated: true,
       effectiveProbability: effectiveProb,
     });
-
-    // If send_reminder / wait_and_retry, also simulate that they are pending states, not recovered
-    // But for demo we treat wait_and_retry as failed for now to allow next step
 
     return { success: finalSuccess && (action === "retry_payment" || action === "create_payment_link") };
   }

@@ -14,8 +14,8 @@ export default function SettingsPage() {
         <CardContent className="space-y-3 text-sm">
           <div className="grid grid-cols-2 gap-4">
             <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-widest text-zinc-500">DATABASE_URL</div>
-              <div className="font-mono text-xs mt-1">{process.env.DATABASE_URL ? "● Configured (Supabase)" : "○ Not set — using mock fallback"}</div>
+              <div className="text-xs uppercase tracking-widest text-zinc-500">SUPABASE</div>
+              <div className="font-mono text-xs mt-1">{process.env.NEXT_PUBLIC_SUPABASE_URL ? "● Configured (Supabase)" : "○ Not set — using mock fallback"}</div>
             </div>
             <div className="rounded-lg border p-3">
               <div className="text-xs uppercase tracking-widest text-zinc-500">OPENROUTER_MODEL</div>

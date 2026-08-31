@@ -6,7 +6,7 @@ Autonomous AI revenue recovery: **Detect → Diagnose → Decide → Act → Mea
 
 RecoverAI detects failed payments, understands why they failed, selects the best recovery strategy with AI, validates against deterministic business rules, executes recovery, and measures revenue recovered — all as an autonomous agent, not a chatbot.
 
-![Demo Mode](https://img.shields.io/badge/Demo-Test%20Mode-amber) ![No Paid APIs](https://img.shields.io/badge/Cost-%E2%82%B90%20Only-green) ![Stack](https://img.shields.io/badge/Stack-Next.js%20%7C%20Prisma%20%7C%20OpenRouter-blue)
+![Demo Mode](https://img.shields.io/badge/Demo-Test%20Mode-amber) ![No Paid APIs](https://img.shields.io/badge/Cost-%E2%82%B90%20Only-green) ![Stack](https://img.shields.io/badge/Stack-Next.js%20%7C%20Supabase%20%7C%20OpenRouter-blue)
 
 ---
 
@@ -30,7 +30,7 @@ All simulated — **no real money**, clearly labeled `SIMULATED • TEST MODE`.
 
 - **Frontend:** Next.js 16 (App Router) • TypeScript strict • Tailwind v4 • shadcn/ui • Lucide • Recharts
 - **Backend:** Next.js Route Handlers (server TypeScript only)
-- **DB:** Supabase PostgreSQL (free) • Prisma 6 ORM (mock fallback when `DATABASE_URL` not set)
+- **DB:** Supabase PostgreSQL (free) via `@supabase/supabase-js` (no Prisma) • mock fallback when Supabase not configured
 - **AI:** OpenRouter free models • configurable via `OPENROUTER_MODEL` • provider abstraction `lib/ai/provider.ts` — no hard-coded model
 - **Payments:** Razorpay Test Mode • `lib/razorpay/*` singleton (no secret on client)
 - **Jobs:** Inngest (`lib/jobs/*`) — sync path for demo latency + async for webhooks
@@ -46,19 +46,18 @@ All simulated — **no real money**, clearly labeled `SIMULATED • TEST MODE`.
 git clone <repo> && cd hackathon-razorpay
 npm install
 cp .env.example .env
-# Edit .env — see below
-npx prisma generate
-# If you have Supabase DATABASE_URL:
-npx prisma db push
-npm run db:seed   # 120 customers, 650 payments, recovery cases
+# Edit .env — see below (Supabase URL + anon + service_role keys)
+# Run migration in Supabase SQL Editor: supabase/migrations/001_initial.sql
+npm run db:seed   # 120 customers, 650 payments, recovery cases (requires Supabase keys)
 npm run dev       # http://localhost:3000 → redirects to /dashboard
 ```
 
 ### Environment
 
 ```env
-DATABASE_URL="postgresql://postgres:[PASS]@[REF].supabase.co:5432/postgres"
-DIRECT_URL="postgresql://postgres:[PASS]@[REF].supabase.co:5432/postgres"
+NEXT_PUBLIC_SUPABASE_URL="https://[REF].supabase.co"
+NEXT_PUBLIC_SUPABASE_ANON_KEY="[anon key]"
+SUPABASE_SERVICE_ROLE_KEY="[service_role key]"
 
 OPENROUTER_API_KEY=""  # optional — falls back to deterministic strategy if empty/unreachable
 OPENROUTER_MODEL="meta-llama/llama-3.1-8b-instruct:free"
@@ -71,7 +70,7 @@ RAZORPAY_WEBHOOK_SECRET="..."
 NEXT_PUBLIC_APP_URL="http://localhost:3000"
 ```
 
-> **No DB?** The app works with **mock fallback** (`src/lib/mock/generate.ts`): `getKPIs()`, `getPayments()`, `getRecoveryCases()` try Prisma, fall back to deterministic synthetic data. Judges can run without Supabase.
+> **No DB?** The app works with **mock fallback** (`src/lib/mock/generate.ts`): `getKPIs()`, `getPayments()`, `getRecoveryCases()` try Supabase, fall back to deterministic synthetic data. Judges can run without Supabase.
 
 ---
 
@@ -130,11 +129,11 @@ Try: Bank timeout + returning customer → `retry_payment` (high prob). Expired 
 
 ---
 
-## Database Schema (Prisma)
+## Database Schema (Supabase)
 
 `Merchant → Customer → Payment → PaymentAttempt / FailureEvent / RecoveryCase → AgentDecision / RecoveryAction` + `Notification` + `WebhookEvent`
 
-See `prisma/schema.prisma`. Seed: `prisma/seed.ts` (Indian names, INR, UPI/Card/Netbanking/Wallet, realistic amounts).
+See `supabase/migrations/001_initial.sql`. Seed: `supabase/seed.ts` (Indian names, INR, UPI/Card/Netbanking/Wallet, realistic amounts). Legacy `prisma/` folder kept for reference only — not used.
 
 ---
 
@@ -163,8 +162,8 @@ See `prisma/schema.prisma`. Seed: `prisma/seed.ts` (Indian names, INR, UPI/Card/
 ```
 app/{dashboard,recovery,transactions,analytics,settings,api/{webhooks/razorpay,demo,kpis,recovery,inngest}}
 components/{ui,dashboard,recovery,transactions,demo,layout}
-lib/{ai/{provider,openrouter,agent,prompts,tools,fallback,config},razorpay, recovery/{engine,policy-engine,strategies,scoring,context}, db/prisma, jobs/{inngest,functions}, mock/generate, data}
-prisma/{schema.prisma, seed.ts}
+lib/{ai/{provider,openrouter,agent,prompts,tools,fallback,config},razorpay, recovery/{engine,policy-engine,strategies,scoring,context}, db/supabase, jobs/{inngest,functions}, mock/generate, data}
+supabase/{migrations/001_initial.sql, seed.ts, README.md}
 types/index.ts
 ```
 
@@ -174,7 +173,7 @@ Clean boundaries: no client secrets, Zod validation, `cn()` utils, loading/error
 
 ## Deployment
 
-Vercel: set env vars, `prisma generate` runs on build, `DATABASE_URL` required for persistence. Inngest dev server optional locally (`npx inngest-cli dev`).
+Vercel: set env vars (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`) — no Prisma generation needed. Inngest dev server optional locally (`npx inngest-cli dev`). Run `supabase/migrations/001_initial.sql` once in Supabase SQL Editor, then `npm run db:seed` locally or via Vercel env.
 
 ---
 

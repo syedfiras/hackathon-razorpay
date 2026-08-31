@@ -17,7 +17,7 @@ export default function Error({ error, reset }: { error: Error; reset: () => voi
         <CardContent className="space-y-3">
           <p className="text-sm text-zinc-600">
             This may happen when the database is not reachable. The app automatically falls back to mock data — try refreshing.
-            If <code className="bg-zinc-100 px-1 rounded">DATABASE_URL</code> is not set, mock data is used.
+            If Supabase (<code className="bg-zinc-100 px-1 rounded">NEXT_PUBLIC_SUPABASE_URL</code>) is not set, mock data is used.
           </p>
           <Button onClick={reset} variant="outline">Try again</Button>
         </CardContent>

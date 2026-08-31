@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { prisma } from "@/lib/db/prisma";
+import { supabase, isSupabaseConfigured } from "@/lib/db/supabase";
 import { buildTransactionContext } from "@/lib/recovery/context";
 import { calculateRecoveryProbability } from "@/lib/recovery/scoring";
 import { AIAgent } from "@/lib/ai/agent";
@@ -16,7 +16,11 @@ const schema = z.object({
 
 // Helper to test DB
 async function canUseDB(): Promise<boolean> {
-  try { await prisma.$queryRaw`SELECT 1`; return true; } catch { return false; }
+  if (!isSupabaseConfigured()) return false;
+  try {
+    const { error } = await supabase.from("payments").select("id").limit(1);
+    return !error;
+  } catch { return false; }
 }
 
 export async function POST(req: NextRequest) {
@@ -97,84 +101,100 @@ export async function POST(req: NextRequest) {
     }
 
     // DB mode — create real records and run engine
-    // Find or create a demo customer
-    let customer = await prisma.customer.findFirst({ where: { email: { contains: "rahul" } } });
+    // Find or create a demo customer via Supabase ilike
+    let customer: any = null;
+    const { data: foundCustomers } = await supabase
+      .from("customers")
+      .select("*")
+      .ilike("email", "%rahul%")
+      .limit(1);
+    if (foundCustomers && foundCustomers.length > 0) {
+      customer = foundCustomers[0];
+    }
     if(!customer){
-      const merchant = await prisma.merchant.findFirst();
+      const { data: merchants } = await supabase.from("merchants").select("*").limit(1);
+      const merchant = merchants?.[0];
       if(!merchant) return NextResponse.json({ error: "No merchant found. Run seed."}, { status: 500 });
-      customer = await prisma.customer.create({
-        data: {
-          merchantId: merchant.id,
+      const { data: newCustomer, error } = await supabase
+        .from("customers")
+        .insert({
+          merchant_id: merchant.id,
           name: parsed.data.customerName || "Rahul Sharma",
           email: `rahul.sharma+${Date.now()}@example.com`,
           phone: "+919876543210",
           segment: "returning",
-          lifetimeValue: 4890000,
-          totalTransactions: 14,
-          successfulTransactions: 12,
-          previousFailures: 2,
-        }
-      });
+          lifetime_value: 4890000,
+          total_transactions: 14,
+          successful_transactions: 12,
+          previous_failures: 2,
+        })
+        .select()
+        .single();
+      if (error) throw new Error(error.message);
+      customer = newCustomer;
     }
 
-    const merchantId = customer.merchantId;
+    const merchantId = (customer as any).merchant_id;
+    const customerId = (customer as any).id;
 
-    const payment = await prisma.payment.create({
-      data: {
-        merchantId,
-        customerId: customer.id,
-        razorpayPaymentId: `pay_${Math.random().toString(36).slice(2,12)}`,
-        razorpayOrderId: `order_${Math.random().toString(36).slice(2,12)}`,
+    const { data: payment, error: payErr } = await supabase
+      .from("payments")
+      .insert({
+        merchant_id: merchantId,
+        customer_id: customerId,
+        razorpay_payment_id: `pay_${Math.random().toString(36).slice(2,12)}`,
+        razorpay_order_id: `order_${Math.random().toString(36).slice(2,12)}`,
         amount,
         currency: "INR",
-        paymentMethod,
+        payment_method: paymentMethod,
         status: "failed",
-        failureReason,
-        failedAt: new Date(),
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      }
+        failure_reason: failureReason,
+        failed_at: new Date().toISOString(),
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .select()
+      .single();
+    if (payErr) throw new Error(payErr.message);
+
+    await supabase.from("payment_attempts").insert({
+      payment_id: (payment as any).id,
+      attempt_no: 1,
+      status: "failed",
+      error_code: failureReason,
+      gateway_response: { error: failureReason, simulated: true },
     });
 
-    await prisma.paymentAttempt.create({
-      data: {
-        paymentId: payment.id,
-        attemptNo: 1,
-        status: "failed",
-        errorCode: failureReason,
-        gatewayResponse: { error: failureReason, simulated: true },
-      }
+    await supabase.from("failure_events").insert({
+      payment_id: (payment as any).id,
+      code: failureReason,
+      reason: failureReason.replace(/_/g," "),
+      gateway_response: { simulated: true, reason: failureReason },
     });
 
-    await prisma.failureEvent.create({
-      data: {
-        paymentId: payment.id,
-        code: failureReason,
-        reason: failureReason.replace(/_/g," "),
-        gatewayResponse: { simulated: true, reason: failureReason },
-      }
-    });
-
-    const recoveryCase = await prisma.recoveryCase.create({
-      data: {
-        paymentId: payment.id,
-        merchantId,
+    const { data: recoveryCase, error: rcErr } = await supabase
+      .from("recovery_cases")
+      .insert({
+        payment_id: (payment as any).id,
+        merchant_id: merchantId,
         status: "open",
-        attemptCount: 0,
-        maxAttempts: 3,
-        lastAction: "pending",
-      }
-    });
+        attempt_count: 0,
+        max_attempts: 3,
+        last_action: "pending",
+      })
+      .select()
+      .single();
+    if (rcErr) throw new Error(rcErr.message);
 
     // Run recovery engine
     const { recoveryEngine } = await import("@/lib/recovery/engine");
-    const result = await recoveryEngine.run(recoveryCase.id);
+    const result = await recoveryEngine.run((recoveryCase as any).id);
 
     return NextResponse.json({
       success: result.success,
       simulated: true,
-      paymentId: payment.id,
-      recoveryCaseId: recoveryCase.id,
+      paymentId: (payment as any).id,
+      recoveryCaseId: (recoveryCase as any).id,
       amount,
       amountRecovered: result.amountRecovered,
       decision: result.aiDecision.decision,

@@ -1,18 +1,11 @@
-import { PrismaClient } from "@prisma/client";
+// LEGACY SHIM — Prisma removed, now using Supabase
+// This file is kept for backward compatibility only.
+// Please import from "@/lib/db/supabase" instead.
+// It re-exports supabase as `prisma` to avoid breaking any lingering imports during migration.
 
-const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClient | undefined;
-};
+import { supabase as supabaseClient } from "./supabase";
 
-export const prisma =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    log:
-      process.env.NODE_ENV === "development"
-        ? ["warn", "error"]
-        : ["error"],
-  });
-
-if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
-
+// Shim: any code still importing `prisma` will get supabase client (will fail gracefully if used as Prisma)
+// Prefer migrating to supabase client directly.
+export const prisma: any = supabaseClient;
 export default prisma;

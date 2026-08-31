@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { prisma } from "@/lib/db/prisma";
+import { supabase } from "@/lib/db/supabase";
 import { verifyWebhookSignature } from "@/lib/razorpay/webhooks";
 
 export async function POST(req: NextRequest) {
@@ -19,19 +19,21 @@ export async function POST(req: NextRequest) {
 
   // Idempotency: check existing
   try {
-    const existing = await prisma.webhookEvent.findUnique({ where: { razorpayEventId } });
-    if (existing?.processed) {
+    const { data: existing } = await supabase
+      .from("webhook_events")
+      .select("*")
+      .eq("razorpay_event_id", razorpayEventId)
+      .maybeSingle();
+    if ((existing as any)?.processed) {
       return NextResponse.json({ received: true, duplicate: true });
     }
     if (!existing) {
-      await prisma.webhookEvent.create({
-        data: {
-          razorpayEventId,
-          event,
-          payload: payload as any,
-          signatureValid,
-          processed: false,
-        }
+      await supabase.from("webhook_events").insert({
+        razorpay_event_id: razorpayEventId,
+        event,
+        payload: payload as any,
+        signature_valid: signatureValid,
+        processed: false,
       });
     }
   } catch (e) {
@@ -40,7 +42,6 @@ export async function POST(req: NextRequest) {
 
   if (!signatureValid) {
     console.warn("[webhook] invalid signature");
-    // In demo mode we still process but mark invalid
   }
 
   // Handle payment.failed
@@ -52,70 +53,107 @@ export async function POST(req: NextRequest) {
 
     try {
       // Find payment by razorpayPaymentId, or create demo payment
-      let payment = razorpayPaymentId ? await prisma.payment.findUnique({ where: { razorpayPaymentId } }) : null;
+      let payment: any = null;
+      if (razorpayPaymentId) {
+        const { data } = await supabase
+          .from("payments")
+          .select("*")
+          .eq("razorpay_payment_id", razorpayPaymentId)
+          .maybeSingle();
+        payment = data;
+      }
       if (!payment) {
-        const merchant = await prisma.merchant.findFirst();
-        const customer = await prisma.customer.findFirst();
+        const { data: merchants } = await supabase.from("merchants").select("*").limit(1);
+        const { data: customers } = await supabase.from("customers").select("*").limit(1);
+        const merchant = merchants?.[0] as any;
+        const customer = customers?.[0] as any;
         if (merchant && customer) {
-          payment = await prisma.payment.create({
-            data: {
-              merchantId: merchant.id,
-              customerId: customer.id,
-              razorpayPaymentId: razorpayPaymentId || `pay_${Date.now()}`,
+          const { data: newPayment } = await supabase
+            .from("payments")
+            .insert({
+              merchant_id: merchant.id,
+              customer_id: customer.id,
+              razorpay_payment_id: razorpayPaymentId || `pay_${Date.now()}`,
               amount: amount || 499900,
-              paymentMethod: paymentEntity.method || "card",
+              payment_method: paymentEntity.method || "card",
               status: "failed",
-              failureReason: typeof failureReason === "string" ? failureReason : "bank_timeout",
-              failedAt: new Date(),
-            }
-          });
-          await prisma.failureEvent.create({
-            data: { paymentId: payment.id, code: String(failureReason), reason: String(failureReason) }
+              failure_reason: typeof failureReason === "string" ? failureReason : "bank_timeout",
+              failed_at: new Date().toISOString(),
+            })
+            .select()
+            .single();
+          payment = newPayment;
+          await supabase.from("failure_events").insert({
+            payment_id: (payment as any).id,
+            code: String(failureReason),
+            reason: String(failureReason),
           });
         }
-      } else if (payment.status !== "failed") {
-        await prisma.payment.update({ where: { id: payment.id }, data: { status: "failed", failureReason: String(failureReason), failedAt: new Date() } });
-        await prisma.failureEvent.create({
-          data: { paymentId: payment.id, code: String(failureReason), reason: String(failureReason) }
+      } else if ((payment as any).status !== "failed") {
+        await supabase
+          .from("payments")
+          .update({
+            status: "failed",
+            failure_reason: String(failureReason),
+            failed_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", (payment as any).id);
+        await supabase.from("failure_events").insert({
+          payment_id: (payment as any).id,
+          code: String(failureReason),
+          reason: String(failureReason),
         });
       }
 
       if (payment) {
         // Create or get recovery case
-        let recoveryCase = await prisma.recoveryCase.findUnique({ where: { paymentId: payment.id } });
+        const { data: existingCase } = await supabase
+          .from("recovery_cases")
+          .select("*")
+          .eq("payment_id", (payment as any).id)
+          .maybeSingle();
+        let recoveryCase: any = existingCase;
         if (!recoveryCase) {
-          recoveryCase = await prisma.recoveryCase.create({
-            data: { paymentId: payment.id, merchantId: payment.merchantId, status: "open" }
-          });
+          const { data: newCase } = await supabase
+            .from("recovery_cases")
+            .insert({
+              payment_id: (payment as any).id,
+              merchant_id: (payment as any).merchant_id,
+              status: "open",
+            })
+            .select()
+            .single();
+          recoveryCase = newCase;
         }
 
         // Trigger recovery (sync for webhook)
         try {
           const { recoveryEngine } = await import("@/lib/recovery/engine");
-          await recoveryEngine.run(recoveryCase.id);
+          await recoveryEngine.run((recoveryCase as any).id);
         } catch (engineErr) {
           console.error("[webhook] engine error", engineErr);
         }
 
-        await prisma.webhookEvent.updateMany({
-          where: { razorpayEventId },
-          data: { processed: true, processedAt: new Date() }
-        });
+        await supabase
+          .from("webhook_events")
+          .update({ processed: true, processed_at: new Date().toISOString() })
+          .eq("razorpay_event_id", razorpayEventId);
       }
     } catch (inner) {
       console.error("[webhook] handling failed", inner);
-      await prisma.webhookEvent.updateMany({
-        where: { razorpayEventId },
-        data: { processed: false, error: String(inner) }
-      });
+      await supabase
+        .from("webhook_events")
+        .update({ processed: false, error: String(inner) })
+        .eq("razorpay_event_id", razorpayEventId);
     }
   } else {
     // Acknowledge other events
     try {
-      await prisma.webhookEvent.updateMany({
-        where: { razorpayEventId },
-        data: { processed: true, processedAt: new Date() }
-      });
+      await supabase
+        .from("webhook_events")
+        .update({ processed: true, processed_at: new Date().toISOString() })
+        .eq("razorpay_event_id", razorpayEventId);
     } catch {}
   }
 

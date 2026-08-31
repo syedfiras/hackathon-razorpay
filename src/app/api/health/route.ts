@@ -1,6 +1,9 @@
 import { NextResponse } from "next/server";
 
 export async function GET() {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || process.env.DATABASE_URL || "";
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
+  const supabaseConfigured = !!supabaseUrl && !!supabaseKey && !supabaseUrl.includes("YOUR-PROJECT-REF") && !supabaseUrl.includes("placeholder");
   return NextResponse.json({
     status: "ok",
     service: "recoverai",
@@ -9,7 +12,8 @@ export async function GET() {
     env: {
       openrouter: !!process.env.OPENROUTER_API_KEY,
       razorpay: !!process.env.RAZORPAY_KEY_ID,
-      database: !!process.env.DATABASE_URL && !process.env.DATABASE_URL.includes("YOUR-PROJECT-REF"),
+      database: supabaseConfigured,
+      supabase: supabaseConfigured,
     }
   });
 }
